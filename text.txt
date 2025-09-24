@@ -1,0 +1,507 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, collection, doc, getDocs, setDoc, addDoc, updateDoc, onSnapshot, query, orderBy } from 'firebase/firestore';
+
+// Ensure the necessary global variables are defined in the Canvas environment
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+
+// Initialize Firebase
+const app = initializeApp(firebaseConfig);
+const db = getFirestore(app);
+const auth = getAuth(app);
+
+// Gemini API configuration
+const API_KEY = ""; // Canvas will provide this at runtime for gemini-2.0-flash and imagen-3.0-generate-002
+const API_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${API_KEY}`;
+
+const App = () => {
+  const [currentScenario, setCurrentScenario] = useState(null);
+  const [scenarios, setScenarios] = useState([]);
+  const [userAnswer, setUserAnswer] = useState('');
+  const [responses, setResponses] = useState([]);
+  const [userId, setUserId] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [submitting, setSubmitting] = useState(false);
+  const [modelInsightLoading, setModelInsightLoading] = useState(false);
+  const [showResponseModal, setShowResponseModal] = useState(false);
+  const [responseModalContent, setResponseModalContent] = useState(null);
+
+  // New states for "What if" feature
+  const [showWhatIfInput, setShowWhatIfInput] = useState(false);
+  const [whatIfQuestion, setWhatIfQuestion] = useState('');
+  const [whatIfResponse, setWhatIfResponse] = useState('');
+  const [whatIfLoading, setWhatIfLoading] = useState(false);
+
+
+  // Firestore collection paths
+  const scenariosCollectionPath = `artifacts/${appId}/public/data/scenarios`;
+  const responsesCollectionPath = `artifacts/${appId}/public/data/responses`;
+
+  // Function to add initial scenarios if none exist
+  const addInitialScenarios = async () => {
+    const scenariosRef = collection(db, scenariosCollectionPath);
+    const scenarioSnapshot = await getDocs(scenariosRef);
+    if (scenarioSnapshot.empty) {
+      console.log("Adding initial scenarios...");
+      const initialScenarios = [
+        {
+          id: 'scenario1',
+          title: 'The Overwhelmed Public Defender',
+          description: "Imagine you are a public defender with an overwhelming caseload – dozens of clients, many of whom are low-income and detained pretrial because they can't afford bail. You have limited time and resources. One client, a young minority individual, insists on their innocence in a minor drug possession charge, but the evidence against them (a vague informant tip and shaky surveillance footage) makes their case look weak on paper. The prosecutor offers a plea deal: plead guilty, get time served, and be released immediately. Going to trial would mean months of work for you, a likely conviction, and potentially a much harsher sentence if lost.",
+          question: "What is your ethical responsibility to this client? What are the competing pressures you face, and how do you navigate them while upholding the principle of 'innocent until proven guilty'?",
+        },
+        {
+          id: 'scenario2',
+          title: 'The Judge and Excessive Bail',
+          description: "A defendant is brought before you, a judge, for a minor offense. They have a stable address and no prior violent history, but they are clearly indigent and cannot afford bail set at $10,000. Your court is overcrowded, and leaving them in jail would reduce your docket pressure. There's also an underlying political pressure to appear 'tough on crime' in your community.",
+          question: "Considering the principle of 'innocent until proven guilty' and the disproportionate impact of cash bail on the poor, what factors should primarily guide your decision regarding bail? What is your ethical duty here, and how might your decision be perceived as 'negligent' from a 'res ipsa loquitur' perspective?",
+        },
+        {
+          id: 'scenario3',
+          title: 'The Police Officer and Uncorroborated Information',
+          description: "You are a police officer investigating a series of petty thefts in a low-income neighborhood. You receive an anonymous tip from a known (but not always reliable) informant, naming a specific minority individual as the culprit. The tip is vague, and your initial surveillance yields inconclusive results. There's pressure from your superiors to close cases quickly in this area.",
+          question: "How do you proceed with this information while respecting constitutional rights and avoiding false implications? How does the concept of 'negligence' apply if you act solely on uncorroborated assumptions, and how can the 'thing itself speak' about the justice or injustice of your actions?",
+        },
+        {
+          id: 'scenario4',
+          title: 'The Prosecutor and Hidden Evidence',
+          description: "You are a prosecutor nearing the end of a high-profile trial. During a last-minute review of evidence, you uncover a piece of exculpatory evidence that was inadvertently overlooked earlier. This new evidence doesn't definitively prove innocence but casts significant doubt on a key witness's testimony and could severely damage your chances of conviction, potentially ruining your professional reputation and conviction record. The defense team is unaware of this evidence.",
+          question: "What is your ethical obligation regarding this newly discovered evidence? How does the 'righteous' path here conflict with career pressures, and what are the implications for the integrity of the justice system if you choose to withhold it?",
+        },
+      ];
+
+      for (const scenario of initialScenarios) {
+        await setDoc(doc(scenariosRef, scenario.id), scenario);
+      }
+      console.log("Initial scenarios added.");
+    }
+  };
+
+  // Auth state listener and Firebase initialization
+  useEffect(() => {
+    const initializeFirebaseAndAuth = async () => {
+      let currentUserId = null;
+      try {
+        if (typeof __initial_auth_token !== 'undefined') {
+          await signInWithCustomToken(auth, __initial_auth_token);
+        } else {
+          await signInAnonymously(auth);
+        }
+
+        const unsubscribe = onAuthStateChanged(auth, async (user) => {
+          if (user) {
+            currentUserId = user.uid;
+            setUserId(currentUserId);
+            console.log("User signed in:", currentUserId);
+
+            // Add initial scenarios if needed (only once after auth is ready)
+            await addInitialScenarios();
+
+            // Fetch scenarios
+            const q = query(collection(db, scenariosCollectionPath));
+            const scenarioSnapshot = await getDocs(q);
+            const loadedScenarios = scenarioSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+            setScenarios(loadedScenarios);
+            if (loadedScenarios.length > 0) {
+              setCurrentScenario(loadedScenarios[0]); // Load the first scenario by default
+            }
+
+            // Set up real-time listener for responses
+            const responsesQ = query(collection(db, responsesCollectionPath), orderBy('timestamp', 'desc'));
+            onSnapshot(responsesQ, (snapshot) => {
+              const loadedResponses = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+              setResponses(loadedResponses);
+              console.log("Responses updated:", loadedResponses);
+            });
+
+          } else {
+            console.log("No user signed in.");
+            setUserId(null); // Ensure userId is null if no user is signed in
+          }
+          setLoading(false);
+        });
+
+        return () => unsubscribe(); // Cleanup auth listener
+      } catch (error) {
+        console.error("Error initializing Firebase or signing in:", error);
+        setLoading(false);
+      }
+    };
+
+    initializeFirebaseAndAuth();
+  }, []); // Run only once on component mount
+
+  const handleScenarioSelect = (scenario) => {
+    setCurrentScenario(scenario);
+    setUserAnswer('');
+    setWhatIfQuestion(''); // Clear what if question on scenario change
+    setWhatIfResponse(''); // Clear what if response on scenario change
+    setShowWhatIfInput(false); // Hide what if input on scenario change
+  };
+
+  const handleSubmitAnswer = async () => {
+    if (!userId || !currentScenario || userAnswer.trim() === '') {
+      console.log("Missing user ID, current scenario, or answer text.");
+      return;
+    }
+
+    setSubmitting(true);
+    setModelInsightLoading(true);
+
+    try {
+      const responseRef = await addDoc(collection(db, responsesCollectionPath), {
+        userId: userId,
+        scenarioId: currentScenario.id,
+        answerText: userAnswer.trim(),
+        timestamp: Date.now(),
+        likes: 0,
+        dislikes: 0,
+        modelInsight: null, // Placeholder for LLM generated insight
+      });
+
+      // Generate LLM insight
+      const prompt = `Given the following scenario and a user's answer, provide a thoughtful, realistic, and constructive insight or feedback (3-5 sentences). Focus on ethical considerations, practical implications, and connections to legal principles discussed (like presumption of innocence, res ipsa loquitur, or challenges of the justice system).
+      
+      Scenario Title: ${currentScenario.title}
+      Scenario Description: ${currentScenario.description}
+      Scenario Question: ${currentScenario.question}
+      User's Answer: ${userAnswer.trim()}
+      
+      Your Insight:`;
+
+      const chatHistory = [{ role: "user", parts: [{ text: prompt }] }];
+      const payload = { contents: chatHistory };
+
+      const apiResponse = await fetch(API_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+
+      const result = await apiResponse.json();
+      let modelInsightText = "Could not generate automated insight at this time.";
+
+      if (result.candidates && result.candidates.length > 0 &&
+          result.candidates[0].content && result.candidates[0].content.parts &&
+          result.candidates[0].content.parts.length > 0) {
+        modelInsightText = result.candidates[0].content.parts[0].text;
+      } else {
+        console.error("Unexpected LLM response structure:", result);
+      }
+
+      // Update the document with the model insight
+      await updateDoc(doc(db, responsesCollectionPath, responseRef.id), {
+        modelInsight: modelInsightText,
+      });
+
+      setUserAnswer(''); // Clear input
+      console.log("Answer submitted and insight generated!");
+
+    } catch (error) {
+      console.error("Error submitting answer or generating insight:", error);
+      // Optionally update the UI to show an error message
+    } finally {
+      setSubmitting(false);
+      setModelInsightLoading(false);
+    }
+  };
+
+  const handleLikeDislike = async (responseId, type) => {
+    if (!userId) return; // Must be signed in to interact
+
+    const responseDocRef = doc(db, responsesCollectionPath, responseId);
+    const responseToUpdate = responses.find(r => r.id === responseId);
+
+    if (!responseToUpdate) return;
+
+    let newLikes = responseToUpdate.likes || 0;
+    let newDislikes = responseToUpdate.dislikes || 0;
+
+    // Prevent self-interaction (already in place) or multiple interactions for simplicity
+    // In a full app, you'd track specific user IDs for likes/dislikes
+    if (type === 'like') {
+      newLikes += 1;
+    } else if (type === 'dislike') {
+      newDislikes += 1;
+    }
+
+    try {
+      await updateDoc(responseDocRef, {
+        likes: newLikes,
+        dislikes: newDislikes,
+      });
+      console.log(`Feedback (${type}) recorded for response ${responseId}`);
+    } catch (error) {
+      console.error("Error updating feedback:", error);
+    }
+  };
+
+  const openResponseModal = (response) => {
+    setResponseModalContent(response);
+    setShowResponseModal(true);
+  };
+
+  const closeResponseModal = () => {
+    setShowResponseModal(false);
+    setResponseModalContent(null);
+  };
+
+  // Handle "What if" submission
+  const handleWhatIfSubmit = async () => {
+    if (!currentScenario || whatIfQuestion.trim() === '') {
+      return;
+    }
+
+    setWhatIfLoading(true);
+    setWhatIfResponse(''); // Clear previous response
+
+    try {
+      const prompt = `Given the following scenario, describe how the situation might unfold or change if this "what if" condition were introduced. Be realistic, thoughtful, and consider potential legal/ethical implications (3-7 sentences).
+
+      Scenario Title: ${currentScenario.title}
+      Scenario Description: ${currentScenario.description}
+      Original Question: ${currentScenario.question}
+      
+      What if: ${whatIfQuestion.trim()}
+      
+      How the scenario might change:`;
+
+      const chatHistory = [{ role: "user", parts: [{ text: prompt }] }];
+      const payload = { contents: chatHistory };
+
+      const apiResponse = await fetch(API_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+
+      const result = await apiResponse.json();
+      let generatedResponse = "Could not generate a 'what if' scenario at this time.";
+
+      if (result.candidates && result.candidates.length > 0 &&
+          result.candidates[0].content && result.candidates[0].content.parts &&
+          result.candidates[0].content.parts.length > 0) {
+        generatedResponse = result.candidates[0].content.parts[0].text;
+      } else {
+        console.error("Unexpected LLM response structure for what if:", result);
+      }
+      setWhatIfResponse(generatedResponse);
+
+    } catch (error) {
+      console.error("Error generating what if response:", error);
+      setWhatIfResponse("An error occurred while generating the 'what if' scenario. Please try again.");
+    } finally {
+      setWhatIfLoading(false);
+    }
+  };
+
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center min-h-screen bg-gray-900 text-white">
+        <div className="text-xl">Loading learning experience...</div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-screen bg-gray-900 text-gray-200 font-inter p-4 sm:p-6 md:p-8 rounded-lg overflow-hidden">
+      {/* Header */}
+      <div className="mb-8 text-center">
+        <h1 className="text-4xl sm:text-5xl font-extrabold text-blue-400 mb-2 rounded-lg p-2 shadow-lg">
+          Justice System Learning Lab
+        </h1>
+        <p className="text-lg sm:text-xl text-gray-300">
+          Reflect, Analyze, and Engage with Ethical Dilemmas in Law
+        </p>
+        <p className="text-sm text-gray-400 mt-2">
+            Your anonymous user ID: <span className="font-mono text-blue-300 break-all">{userId ? userId.substring(0, 8) + '...' : 'Loading...'}</span>
+        </p>
+      </div>
+
+      {/* Main Content Area */}
+      <div className="flex flex-col md:flex-row gap-6">
+
+        {/* Scenarios List */}
+        <div className="w-full md:w-1/4 bg-gray-800 p-4 rounded-lg shadow-xl border border-blue-700">
+          <h2 className="text-2xl font-bold text-blue-300 mb-4 pb-2 border-b border-blue-600">Scenarios</h2>
+          <nav className="space-y-2">
+            {scenarios.map((scenario) => (
+              <button
+                key={scenario.id}
+                onClick={() => handleScenarioSelect(scenario)}
+                className={`w-full text-left p-3 rounded-lg transition-all duration-200 ease-in-out
+                  ${currentScenario && currentScenario.id === scenario.id
+                    ? 'bg-blue-600 text-white shadow-md'
+                    : 'bg-gray-700 text-gray-300 hover:bg-blue-700 hover:text-white'
+                  }`}
+              >
+                <span className="font-medium">{scenario.title}</span>
+              </button>
+            ))}
+          </nav>
+        </div>
+
+        {/* Current Scenario & User Input */}
+        <div className="flex-1 bg-gray-800 p-6 rounded-lg shadow-xl border border-blue-700">
+          {currentScenario ? (
+            <>
+              <h2 className="text-3xl font-bold text-blue-300 mb-4">{currentScenario.title}</h2>
+              <p className="text-gray-300 leading-relaxed mb-6">{currentScenario.description}</p>
+              <div className="bg-gray-700 p-4 rounded-lg border border-blue-500 shadow-inner mb-6">
+                <p className="text-blue-200 font-semibold text-lg mb-2">The Hard Question:</p>
+                <p className="text-white italic">{currentScenario.question}</p>
+              </div>
+
+              <textarea
+                className="w-full p-3 bg-gray-700 border border-blue-500 rounded-lg text-white placeholder-gray-400 focus:ring-2 focus:ring-blue-400 focus:border-transparent transition-all duration-200"
+                rows="8"
+                placeholder="Type your thoughtful and realistic answer here..."
+                value={userAnswer}
+                onChange={(e) => setUserAnswer(e.target.value)}
+                disabled={submitting}
+              ></textarea>
+
+              <button
+                onClick={handleSubmitAnswer}
+                disabled={submitting || userAnswer.trim() === ''}
+                className="mt-4 w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 px-6 rounded-lg shadow-md transition-all duration-300 ease-in-out disabled:opacity-50 disabled:cursor-not-allowed transform hover:scale-105"
+              >
+                {submitting ? 'Submitting...' : 'Submit My Answer'}
+              </button>
+              {modelInsightLoading && (
+                <p className="mt-2 text-center text-blue-300">Generating model insight...</p>
+              )}
+
+              {/* What If Feature */}
+              <div className="mt-8 pt-6 border-t border-blue-700">
+                <button
+                  onClick={() => setShowWhatIfInput(!showWhatIfInput)}
+                  className="w-full bg-purple-600 hover:bg-purple-700 text-white font-bold py-3 px-6 rounded-lg shadow-md transition-all duration-300 ease-in-out transform hover:scale-105 flex items-center justify-center"
+                >
+                  Explore 'What If' Scenarios ✨
+                </button>
+
+                {showWhatIfInput && (
+                  <div className="mt-4 bg-gray-700 p-4 rounded-lg border border-purple-500 shadow-inner">
+                    <p className="text-purple-200 font-semibold text-lg mb-2">What if...?</p>
+                    <textarea
+                      className="w-full p-3 bg-gray-600 border border-purple-500 rounded-lg text-white placeholder-gray-400 focus:ring-2 focus:ring-purple-400 focus:border-transparent transition-all duration-200"
+                      rows="4"
+                      placeholder="e.g., What if the defendant had a strong alibi?"
+                      value={whatIfQuestion}
+                      onChange={(e) => setWhatIfQuestion(e.target.value)}
+                      disabled={whatIfLoading}
+                    ></textarea>
+                    <button
+                      onClick={handleWhatIfSubmit}
+                      disabled={whatIfLoading || whatIfQuestion.trim() === ''}
+                      className="mt-3 w-full bg-purple-500 hover:bg-purple-600 text-white font-bold py-2 px-4 rounded-lg shadow-md transition-all duration-300 ease-in-out disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      {whatIfLoading ? 'Generating...' : 'Generate What If Scenario'}
+                    </button>
+                    {whatIfLoading && (
+                      <p className="mt-2 text-center text-purple-300">Generating 'what if' insight...</p>
+                    )}
+                    {whatIfResponse && (
+                      <div className="mt-4 p-3 bg-gray-800 rounded-lg border border-purple-400 text-purple-100 leading-relaxed italic">
+                        <p className="font-semibold text-purple-300 mb-2">How the scenario might change:</p>
+                        {whatIfResponse}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            </>
+          ) : (
+            <p className="text-center text-2xl text-gray-400 mt-10">Select a scenario from the left to begin!</p>
+          )}
+        </div>
+      </div>
+
+      {/* Responses Section */}
+      <div className="mt-8 bg-gray-800 p-6 rounded-lg shadow-xl border border-blue-700">
+        <h2 className="text-3xl font-bold text-blue-300 mb-4 pb-2 border-b border-blue-600">Community Responses & Insights</h2>
+        <div className="space-y-6">
+          {responses.length === 0 ? (
+            <p className="text-gray-400 text-center">No responses yet. Be the first to share your thoughts!</p>
+          ) : (
+            responses
+              .filter(response => response.scenarioId === (currentScenario ? currentScenario.id : null))
+              .map((response) => (
+                <div key={response.id} className="bg-gray-700 p-4 rounded-lg shadow-md border border-gray-600">
+                  <p className="text-gray-300 text-sm mb-2">
+                    <span className="font-mono text-blue-300">{userId ? response.userId.substring(0, 8) + '...' : 'Anonymous'}</span>{' '}
+                    <span className="text-xs text-gray-500">
+                      ({new Date(response.timestamp).toLocaleString()})
+                    </span>
+                  </p>
+                  <p className="text-white leading-relaxed mb-3 line-clamp-3 hover:line-clamp-none cursor-pointer"
+                     onClick={() => openResponseModal(response)}>
+                    {response.answerText}
+                  </p>
+                  <div className="flex items-center justify-between mt-3">
+                    <div className="flex space-x-3">
+                      <button
+                        onClick={() => handleLikeDislike(response.id, 'like')}
+                        className="flex items-center text-green-400 hover:text-green-500 transition-colors duration-200 disabled:opacity-50 disabled:cursor-not-allowed"
+                        disabled={response.userId === userId} // Disable self-interaction
+                      >
+                        <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5 mr-1" viewBox="0 0 20 20" fill="currentColor">
+                          <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm.707-10.293a1 1 0 00-1.414 0l-3 3a1 1 0 001.414 1.414L9 11.414V15a1 1 0 102 0v-3.586l1.293 1.293a1 1 0 001.414-1.414l-3-3z" clipRule="evenodd" />
+                        </svg>
+                        {response.likes || 0}
+                      </button>
+                      <button
+                        onClick={() => handleLikeDislike(response.id, 'dislike')}
+                        className="flex items-center text-red-400 hover:text-red-500 transition-colors duration-200 disabled:opacity-50 disabled:cursor-not-allowed"
+                        disabled={response.userId === userId} // Disable self-interaction
+                      >
+                        <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5 mr-1" viewBox="0 0 20 20" fill="currentColor">
+                          <path fillRule="evenodd" d="M10 2a8 8 0 100 16 8 8 0 000-16zm.707 10.293a1 1 0 00-1.414 0l-3-3a1 1 0 101.414-1.414L9 8.586V5a1 1 0 102 0v3.586l1.293-1.293a1 1 0 101.414 1.414l-3 3z" clipRule="evenodd" />
+                        </svg>
+                        {response.dislikes || 0}
+                      </button>
+                    </div>
+                    {response.modelInsight && (
+                      <button
+                        onClick={() => openResponseModal(response)}
+                        className="px-3 py-1 bg-blue-500 text-white text-sm rounded-lg hover:bg-blue-600 transition-colors duration-200 shadow-md"
+                      >
+                        View Insight
+                      </button>
+                    )}
+                  </div>
+                </div>
+              ))
+          )}
+        </div>
+      </div>
+
+      {/* Response Modal */}
+      {showResponseModal && responseModalContent && (
+        <div className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center p-4 z-50">
+          <div className="bg-gray-800 p-6 rounded-lg shadow-2xl max-w-2xl w-full max-h-[90vh] overflow-y-auto border border-blue-600">
+            <h3 className="text-xl font-bold text-blue-300 mb-3 border-b pb-2 border-blue-500">User's Answer</h3>
+            <p className="text-gray-200 leading-relaxed mb-4">{responseModalContent.answerText}</p>
+
+            <h3 className="text-xl font-bold text-blue-300 mb-3 border-b pb-2 border-blue-500">Model Insight</h3>
+            <p className="text-blue-100 leading-relaxed italic">{responseModalContent.modelInsight || "Insight not available."}</p>
+
+            <button
+              onClick={closeResponseModal}
+              className="mt-6 w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-lg shadow-md transition-all duration-300 ease-in-out"
+            >
+              Close
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+export default App;
+
